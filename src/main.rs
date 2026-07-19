@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -9,9 +10,8 @@ use tokio::time::Duration;
 
 // Import core functions from the library crate
 use mcservernap::config;
-use mcservernap::{
-    ServerState, idle_watchdog_rcon, launch_server, send_stop_command, verify_handshake_packet,
-};
+use mcservernap::msmp::send_stop_command;
+use mcservernap::{ServerState, idle_watchdog_msmp, launch_server, verify_handshake_packet};
 
 /// "Serverless" Minecraft Server Watcher
 #[derive(Parser)]
@@ -37,21 +37,15 @@ enum Commands {
         /// Minecraft server port (use --server-port)
         #[arg(long)]
         server_port: u16,
-        /// RCON port (use --rcon-port)
-        #[arg(long)]
-        rcon_port: u16,
-        /// RCON password (use --rcon-pass)
-        #[arg(long)]
-        rcon_pass: String,
+        /// Path to the Minecraft 26.2 server.properties file
+        #[arg(long, default_value = "server.properties")]
+        server_properties: PathBuf,
     },
-    /// Immediately stop the Minecraft server via RCON
+    /// Immediately stop the Minecraft server through MSMP
     Stop {
-        /// RCON port
-        #[arg(long)]
-        rcon_port: u16,
-        /// RCON password
-        #[arg(long)]
-        rcon_pass: String,
+        /// Path to the Minecraft 26.2 server.properties file
+        #[arg(long, default_value = "server.properties")]
+        server_properties: PathBuf,
     },
 }
 
@@ -71,12 +65,9 @@ async fn main() -> Result<()> {
             cmd,
             args,
             server_port,
-            rcon_port,
-            rcon_pass,
+            server_properties,
         } => {
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-            let rcon_addr = Arc::new(format!("127.0.0.1:{}", rcon_port));
-            let rcon_pass = Arc::new(rcon_pass);
 
             let server_state = Arc::new(Mutex::new(ServerState::Stopped));
             let app_config: config::Config = config::get_config();
@@ -85,8 +76,7 @@ async fn main() -> Result<()> {
             log::info!("Listening for login on {}", addr);
 
             // Clone handles for shutdown handler
-            let rcon_addr_shutdown = rcon_addr.clone();
-            let rcon_pass_shutdown = rcon_pass.clone();
+            let server_properties_shutdown = server_properties.clone();
             let server_state_shutdown = server_state.clone();
 
             tokio::select! {
@@ -95,8 +85,7 @@ async fn main() -> Result<()> {
                     cmd,
                     args,
                     server_port,
-                    rcon_addr,
-                    rcon_pass,
+                    server_properties,
                     server_state,
                     app_config
                 ) => {},
@@ -115,10 +104,10 @@ async fn main() -> Result<()> {
 
                     if *state_guard == ServerState::Running {
                         log::info!("Stopping Minecraft server gracefully...");
-                        drop(state_guard); // Release Mutex lock before RCON call
+                        drop(state_guard);
 
-                        if let Err(e) = send_stop_command(&rcon_addr_shutdown, &rcon_pass_shutdown).await {
-                            log::error!("Failed to send stop command: {}", e);
+                        if let Err(e) = send_stop_command(&server_properties_shutdown).await {
+                            log::error!("Failed to send MSMP stop request: {}", e);
                         } else {
                             // Give server time to stop
                             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -127,12 +116,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Stop {
-            rcon_port,
-            rcon_pass,
-        } => {
-            let rcon_addr = format!("127.0.0.1:{}", rcon_port);
-            send_stop_command(&rcon_addr, &rcon_pass).await?;
+        Commands::Stop { server_properties } => {
+            send_stop_command(server_properties).await?;
         }
     }
 
@@ -144,8 +129,7 @@ async fn main_loop(
     cmd: String,
     args: Vec<String>,
     server_port: u16,
-    rcon_addr: Arc<String>,
-    rcon_pass: Arc<String>,
+    server_properties: PathBuf,
     server_state: Arc<Mutex<ServerState>>,
     app_config: config::Config,
 ) -> Result<()> {
@@ -175,7 +159,7 @@ async fn main_loop(
 
                     match *state_guard {
                         ServerState::Stopped => {
-                            // Start the server and RCON watchdog
+                            // Start the server and MSMP watchdog
                             match verify_handshake_packet(&mut client_socket, peer, &app_config)
                                 .await
                             {
@@ -195,16 +179,17 @@ async fn main_loop(
 
                                     let mut child = launch_server(&cmd, &arg_slices)?;
 
-                                    let rcon_addr_clone = rcon_addr.clone();
-                                    let rcon_pass_clone = rcon_pass.clone();
-                                    let server_state_for_rcon_watchdog = server_state.clone();
-                                    let rcon_watchdog_handle = tokio::spawn(async move {
-                                        if let Err(e) = idle_watchdog_rcon(
-                                            &rcon_addr_clone,
-                                            &rcon_pass_clone,
-                                            Duration::from_secs(app_config.rcon_poll_interval), // check interval
-                                            Duration::from_secs(app_config.rcon_idle_timeout), // idle timeout
-                                            server_state_for_rcon_watchdog,
+                                    let server_properties_for_watchdog = server_properties.clone();
+                                    let server_state_for_watchdog = server_state.clone();
+                                    let poll_interval =
+                                        Duration::from_secs(app_config.management_poll_interval);
+                                    let idle_timeout = Duration::from_secs(app_config.idle_timeout);
+                                    let watchdog_handle = tokio::spawn(async move {
+                                        if let Err(e) = idle_watchdog_msmp(
+                                            &server_properties_for_watchdog,
+                                            poll_interval,
+                                            idle_timeout,
+                                            server_state_for_watchdog,
                                         )
                                         .await
                                         {
@@ -225,8 +210,8 @@ async fn main_loop(
                                             }
                                         }
 
-                                        rcon_watchdog_handle.abort();
-                                        log::info!("RCON watchdog aborted");
+                                        watchdog_handle.abort();
+                                        log::info!("MSMP watchdog aborted");
 
                                         {
                                             let mut state = match tokio::time::timeout(

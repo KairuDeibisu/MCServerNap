@@ -10,9 +10,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(default)]
 pub struct Config {
-    pub rcon_poll_interval: u64,
-    pub rcon_idle_timeout: u64,
+    pub management_poll_interval: u64,
+    pub idle_timeout: u64,
     pub motd_text: String,
     pub motd_color: String,
     pub motd_bold: bool,
@@ -26,8 +27,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            rcon_poll_interval: 60,
-            rcon_idle_timeout: 600,
+            management_poll_interval: 60,
+            idle_timeout: 600,
             motd_text: "Napping... Join to start server".to_string(),
             motd_color: "aqua".to_string(),
             motd_bold: true,

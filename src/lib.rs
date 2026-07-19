@@ -1,12 +1,13 @@
 pub mod config;
+pub mod msmp;
 
 use crate::config::Config;
+use crate::msmp::{MsmpClient, MsmpConfig};
 use anyhow::Result;
-use rcon::Connection;
-use regex::Regex;
 use serde_json::{Value, json};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -164,53 +165,46 @@ pub fn launch_server(command: &str, args: &[&str]) -> Result<tokio::process::Chi
     }
 }
 
-/// Idle watchdog: polls the RCON `list` command every `poll_interval`.
-/// If no players have been online for `timeout`, send `/stop` via RCON and exit
-pub async fn idle_watchdog_rcon(
-    rcon_addr: &str,
-    rcon_pass: &str,
+/// Idle watchdog: polls Minecraft 26.2's management server every `poll_interval`.
+/// If no players have been online for `timeout`, stop the server through MSMP.
+pub async fn idle_watchdog_msmp(
+    properties_path: &Path,
     poll_interval: Duration,
     timeout: Duration,
     server_state: Arc<Mutex<ServerState>>,
 ) -> Result<()> {
     log::info!(
-        "Starting RCON idle watchdog: polling {} every {:?}",
-        rcon_addr,
+        "Starting MSMP idle watchdog using {} every {:?}",
+        properties_path.display(),
         poll_interval
     );
     let start = Instant::now();
 
-    // Wait for RCON to become available
-    let conn = loop {
-        match Connection::<TcpStream>::connect(rcon_addr, rcon_pass).await {
-            Ok(c) => break c,
+    // MSMP 3.0.0 starts before the dedicated server. Wait until its status says
+    // the Minecraft server has finished starting before accepting proxy traffic.
+    loop {
+        match query_server_status(properties_path).await {
+            Ok(status) if status.started => break,
+            Ok(_) if start.elapsed() <= Duration::from_secs(600) => {
+                log::info!("MSMP is available; Minecraft 26.2 is still starting...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             Err(err) if start.elapsed() <= Duration::from_secs(600) => {
-                log::warn!("RCON connection failed ({}), retrying...", err);
+                log::warn!("MSMP status check failed ({}), retrying...", err);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             Err(err) => {
-                {
-                    // Exclusively scoping all Mutex locks, even if it's not strictly necessary
-                    let mut state =
-                        match tokio::time::timeout(Duration::from_secs(5), server_state.lock())
-                            .await
-                        {
-                            Ok(guard) => guard,
-                            Err(_) => {
-                                log::error!("Deadlock detected! Failed to acquire state lock");
-                                panic!("State lock timeout - possible deadlock");
-                            }
-                        };
-                    *state = ServerState::Stopped;
-                    log::debug!("Server state set to Stopped in idle_watchdog_rcon()");
-                }
-                return Err(err.into());
+                return Err(err);
+            }
+            Ok(_) => {
+                return Err(anyhow::anyhow!(
+                    "Minecraft server did not finish starting within 600 seconds"
+                ));
             }
         }
-    };
+    }
 
-    let mut conn = conn;
-    log::info!("Successfully connected to RCON at {}", rcon_addr);
+    log::info!("Minecraft 26.2 is running and MSMP is ready");
     {
         let mut state =
             match tokio::time::timeout(Duration::from_secs(5), server_state.lock()).await {
@@ -221,81 +215,54 @@ pub async fn idle_watchdog_rcon(
                 }
             };
         *state = ServerState::Running;
-        log::debug!("Server state set to Running in idle_watchdog_rcon()");
+        log::debug!("Server state set to Running in idle_watchdog_msmp()");
     }
 
-    // Polling loop
-    let player_count_re = Regex::new(r"There are (\d+) of a max").unwrap();
     let mut ticker = interval(poll_interval);
     let mut last_online = Instant::now();
     let mut consecutive_errors = 0;
 
     loop {
         ticker.tick().await;
-        let response = loop {
-            match conn.cmd("list").await {
-                Ok(r) => {
+        let status = loop {
+            match query_server_status(properties_path).await {
+                Ok(status) => {
                     consecutive_errors = 0;
-                    break r;
+                    break status;
                 }
                 Err(e) if consecutive_errors < 5 => {
                     consecutive_errors += 1;
                     log::warn!(
-                        "RCON `list` poll failed: {} \nRetrying... ({}/5)",
+                        "MSMP status poll failed: {}. Retrying... ({}/5)",
                         e,
                         consecutive_errors
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
                 Err(e) => {
-                    log::error!("RCON connection error: {}. Stopping RCON watchdog.", e);
-                    {
-                        let mut state =
-                            match tokio::time::timeout(Duration::from_secs(5), server_state.lock())
-                                .await
-                            {
-                                Ok(guard) => guard,
-                                Err(_) => {
-                                    log::error!("Deadlock detected! Failed to acquire state lock");
-                                    panic!("State lock timeout - possible deadlock");
-                                }
-                            };
-                        *state = ServerState::Stopped;
-                        log::debug!("Server state set to Stopped in idle_watchdog_rcon()");
-                    }
-                    return Err(e.into());
+                    log::error!("MSMP connection error: {}. Stopping watchdog.", e);
+                    return Err(e);
                 }
             };
         };
-        log::info!("RCON list response: {}", response);
-
-        let count = player_count_re
-            .captures(&response)
-            .and_then(|caps| caps.get(1))
-            .and_then(|m| m.as_str().parse::<u32>().ok())
-            .unwrap_or(0);
+        let count = status.players.len();
+        log::info!("MSMP reports {} connected player(s)", count);
 
         if count > 0 {
             last_online = Instant::now();
         } else if last_online.elapsed() >= timeout {
             log::info!("No players for {:?}, stopping server...", timeout);
-            let _ = conn.cmd("stop").await;
+            msmp::send_stop_command(properties_path).await?;
             break;
         }
     }
     Ok(())
 }
 
-/// Sends a single `/stop` command to the server via RCON and exits
-pub async fn send_stop_command(rcon_addr: &str, rcon_pass: &str) -> Result<()> {
-    log::info!(
-        "Connecting to RCON at {} to send stop command...",
-        rcon_addr
-    );
-    let mut conn = Connection::<TcpStream>::connect(rcon_addr, rcon_pass).await?;
-    let _ = conn.cmd("stop").await?;
-    log::info!("Stop command sent.");
-    Ok(())
+async fn query_server_status(properties_path: &Path) -> Result<msmp::ServerStatus> {
+    let config = MsmpConfig::from_server_properties(properties_path)?;
+    let mut client = MsmpClient::connect(&config).await?;
+    client.server_status().await
 }
 
 pub async fn send_starting_message(mut socket: TcpStream, config: &Config) -> Result<()> {
@@ -339,12 +306,11 @@ async fn handle_status_ping(socket: &mut TcpStream, config: &Config) -> Result<(
     }
 
     // Create custom MOTD JSON
-    // Protocol is "an integer used to check for incompatibilities between the player's client and the server
-    // they are trying to connect to.". 766 = Minecraft 1.20.5 (https://minecraft.fandom.com/wiki/Protocol_version)
+    // Minecraft 26.2 uses Java protocol version 776.
     let mut motd_json_obj = json!({
         "version": {
-            "name": "MCServerNap (1.20.5)",
-            "protocol": 766
+            "name": "MCServerNap (26.2)",
+            "protocol": 776
         },
         "players": {
             "max": 0,
