@@ -2,11 +2,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::future::pending;
 use std::path::Path;
 use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Duration, Instant, sleep, sleep_until, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
@@ -15,11 +17,16 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 const JSON_RPC_VERSION: &str = "2.0";
 const SERVER_STATUS_METHOD: &str = "minecraft:server/status";
 const SERVER_STOP_METHOD: &str = "minecraft:server/stop";
+const NOTIFICATION_PREFIX: &str = "minecraft:notification/";
+const INITIAL_CONNECT_WINDOW: Duration = Duration::from_secs(60);
+const RETRY_INTERVAL: Duration = Duration::from_secs(3);
+const RECONNECT_ATTEMPTS: u8 = 3;
 
 #[derive(Clone)]
 pub struct MsmpConfig {
     url: String,
     secret: String,
+    server_port: u16,
 }
 
 impl MsmpConfig {
@@ -67,10 +74,26 @@ impl MsmpConfig {
             host.to_owned()
         };
 
+        let server_port = properties
+            .get("server-port")
+            .map(String::as_str)
+            .unwrap_or("25565")
+            .parse::<u16>()
+            .context("server-port must be a valid TCP port")?;
+
         Ok(Self {
             url: format!("ws://{host}:{port}"),
             secret,
+            server_port,
         })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.url
+    }
+
+    pub fn server_port(&self) -> u16 {
+        self.server_port
     }
 }
 
@@ -104,22 +127,35 @@ fn parse_server_properties(contents: &str) -> HashMap<String, String> {
         .collect()
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ServerStatus {
     pub started: bool,
     #[serde(default)]
     pub players: Vec<Player>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Player {
-    pub id: String,
-    pub name: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MsmpEvent {
+    ServerStarted,
+    ServerStopping,
+    PlayerJoined(Player),
+    PlayerLeft(Player),
+    Status(ServerStatus),
+    Other(String),
 }
 
 pub struct MsmpClient {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_request_id: u64,
+    pending_events: VecDeque<MsmpEvent>,
 }
 
 impl MsmpClient {
@@ -141,6 +177,7 @@ impl MsmpClient {
         Ok(Self {
             socket,
             next_request_id: 1,
+            pending_events: VecDeque::new(),
         })
     }
 
@@ -152,6 +189,33 @@ impl MsmpClient {
     pub async fn stop(&mut self) -> Result<()> {
         self.call(SERVER_STOP_METHOD).await?;
         Ok(())
+    }
+
+    pub async fn next_event(&mut self) -> Result<MsmpEvent> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(event);
+        }
+
+        while let Some(message) = self.socket.next().await {
+            match message.context("failed to read MSMP notification")? {
+                Message::Text(text) => {
+                    let message: Value = serde_json::from_str(text.as_str())
+                        .context("MSMP returned invalid JSON")?;
+                    if let Some(event) = parse_notification(&message)? {
+                        return Ok(event);
+                    }
+                }
+                Message::Ping(payload) => {
+                    self.socket.send(Message::Pong(payload)).await?;
+                }
+                Message::Close(frame) => {
+                    bail!("MSMP connection closed: {frame:?}");
+                }
+                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
+
+        bail!("MSMP connection ended")
     }
 
     async fn call(&mut self, method: &str) -> Result<Value> {
@@ -180,16 +244,19 @@ impl MsmpClient {
                     let response: Value = serde_json::from_str(text.as_str())
                         .context("MSMP returned invalid JSON")?;
 
-                    if response.get("id").and_then(Value::as_u64) != Some(id) {
-                        continue;
+                    if response.get("id").and_then(Value::as_u64) == Some(id) {
+                        if let Some(error) = response.get("error") {
+                            bail!("MSMP method {method} failed: {error}");
+                        }
+                        return response
+                            .get("result")
+                            .cloned()
+                            .ok_or_else(|| anyhow!("MSMP method {method} returned no result"));
                     }
-                    if let Some(error) = response.get("error") {
-                        bail!("MSMP method {method} failed: {error}");
+
+                    if let Some(event) = parse_notification(&response)? {
+                        self.pending_events.push_back(event);
                     }
-                    return response
-                        .get("result")
-                        .cloned()
-                        .ok_or_else(|| anyhow!("MSMP method {method} returned no result"));
                 }
                 Message::Ping(payload) => {
                     self.socket.send(Message::Pong(payload)).await?;
@@ -203,6 +270,337 @@ impl MsmpClient {
 
         bail!("MSMP connection ended while waiting for {method}")
     }
+}
+
+fn parse_notification(message: &Value) -> Result<Option<MsmpEvent>> {
+    if message.get("id").is_some() {
+        return Ok(None);
+    }
+
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let path = method.strip_prefix(NOTIFICATION_PREFIX).unwrap_or(method);
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+
+    let event = match path {
+        "server/started" => MsmpEvent::ServerStarted,
+        "server/stopping" => MsmpEvent::ServerStopping,
+        "players/joined" => MsmpEvent::PlayerJoined(decode_params(params, "player")?),
+        "players/left" => MsmpEvent::PlayerLeft(decode_params(params, "player")?),
+        "server/status" => MsmpEvent::Status(decode_params(params, "status")?),
+        _ => MsmpEvent::Other(method.to_owned()),
+    };
+    Ok(Some(event))
+}
+
+fn decode_params<T: for<'de> Deserialize<'de>>(params: Value, wrapper: &str) -> Result<T> {
+    let value = params.get(wrapper).cloned().unwrap_or(params);
+    serde_json::from_value(value)
+        .with_context(|| format!("invalid MSMP notification parameter {wrapper}"))
+}
+
+#[derive(Debug)]
+pub enum SessionUpdate {
+    Snapshot(ServerStatus),
+    ServerStarted,
+    ServerStopping,
+    PlayerCount(usize),
+    ConnectionInterrupted(String),
+    ReconnectAttempt(u8),
+    ConnectionLost(String),
+    Unavailable(String),
+}
+
+pub enum SessionCommand {
+    Stop {
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+}
+
+struct TrackedServer {
+    started: bool,
+    players: Vec<Player>,
+    idle_deadline: Option<Instant>,
+    startup_deadline: Option<Instant>,
+    idle_timeout: Duration,
+}
+
+impl TrackedServer {
+    fn new(status: &ServerStatus, idle_timeout: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            started: status.started,
+            players: status.players.clone(),
+            idle_deadline: (status.started && status.players.is_empty())
+                .then_some(now + idle_timeout),
+            startup_deadline: (!status.started).then_some(now + INITIAL_CONNECT_WINDOW),
+            idle_timeout,
+        }
+    }
+
+    fn apply_snapshot(&mut self, status: &ServerStatus) {
+        let was_started = self.started;
+        let had_players = !self.players.is_empty();
+        self.started = status.started;
+        self.players.clone_from(&status.players);
+
+        if self.started {
+            self.startup_deadline = None;
+            if self.players.is_empty() {
+                if !was_started || had_players || self.idle_deadline.is_none() {
+                    self.idle_deadline = Some(Instant::now() + self.idle_timeout);
+                }
+            } else {
+                self.idle_deadline = None;
+            }
+        } else {
+            self.idle_deadline = None;
+            if self.startup_deadline.is_none() {
+                self.startup_deadline = Some(Instant::now() + INITIAL_CONNECT_WINDOW);
+            }
+        }
+    }
+
+    fn server_started(&mut self) {
+        self.started = true;
+        self.startup_deadline = None;
+        if self.players.is_empty() {
+            self.idle_deadline = Some(Instant::now() + self.idle_timeout);
+        }
+    }
+
+    fn player_joined(&mut self, player: Player) {
+        if !self
+            .players
+            .iter()
+            .any(|current| same_player(current, &player))
+        {
+            self.players.push(player);
+        }
+        self.idle_deadline = None;
+    }
+
+    fn player_left(&mut self, player: &Player) {
+        let previously_online = !self.players.is_empty();
+        self.players.retain(|current| !same_player(current, player));
+        if self.started && previously_online && self.players.is_empty() {
+            self.idle_deadline = Some(Instant::now() + self.idle_timeout);
+        }
+    }
+}
+
+fn same_player(left: &Player, right: &Player) -> bool {
+    left.id
+        .as_ref()
+        .zip(right.id.as_ref())
+        .is_some_and(|(left, right)| left == right)
+        || left
+            .name
+            .as_ref()
+            .zip(right.name.as_ref())
+            .is_some_and(|(left, right)| left == right)
+}
+
+pub async fn run_session(
+    config: MsmpConfig,
+    idle_timeout: Duration,
+    updates: mpsc::Sender<SessionUpdate>,
+    mut commands: mpsc::Receiver<SessionCommand>,
+) {
+    let (mut client, initial_status) = match connect_with_initial_retry(&config).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            let _ = updates
+                .send(SessionUpdate::Unavailable(error.to_string()))
+                .await;
+            return;
+        }
+    };
+
+    log::info!("Connected to persistent MSMP session at {}", config.url);
+    let mut tracked = TrackedServer::new(&initial_status, idle_timeout);
+    if updates
+        .send(SessionUpdate::Snapshot(initial_status))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        match run_connected(&mut client, &mut tracked, &updates, &mut commands).await {
+            ConnectedOutcome::Finished => return,
+            ConnectedOutcome::Disconnected(error) => {
+                if updates
+                    .send(SessionUpdate::ConnectionInterrupted(error.to_string()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                match reconnect(&config, &updates).await {
+                    Ok((new_client, status)) => {
+                        client = new_client;
+                        tracked.apply_snapshot(&status);
+                        if updates.send(SessionUpdate::Snapshot(status)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = updates
+                            .send(SessionUpdate::ConnectionLost(error.to_string()))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum ConnectedOutcome {
+    Finished,
+    Disconnected(anyhow::Error),
+}
+
+async fn run_connected(
+    client: &mut MsmpClient,
+    tracked: &mut TrackedServer,
+    updates: &mpsc::Sender<SessionUpdate>,
+    commands: &mut mpsc::Receiver<SessionCommand>,
+) -> ConnectedOutcome {
+    loop {
+        tokio::select! {
+            event = client.next_event() => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => return ConnectedOutcome::Disconnected(error),
+                };
+                match event {
+                    MsmpEvent::ServerStarted => {
+                        tracked.server_started();
+                        if updates.send(SessionUpdate::ServerStarted).await.is_err() {
+                            return ConnectedOutcome::Finished;
+                        }
+                    }
+                    MsmpEvent::ServerStopping => {
+                        let _ = updates.send(SessionUpdate::ServerStopping).await;
+                        return ConnectedOutcome::Finished;
+                    }
+                    MsmpEvent::PlayerJoined(player) => {
+                        tracked.player_joined(player);
+                        if updates.send(SessionUpdate::PlayerCount(tracked.players.len())).await.is_err() {
+                            return ConnectedOutcome::Finished;
+                        }
+                    }
+                    MsmpEvent::PlayerLeft(player) => {
+                        tracked.player_left(&player);
+                        if updates.send(SessionUpdate::PlayerCount(tracked.players.len())).await.is_err() {
+                            return ConnectedOutcome::Finished;
+                        }
+                    }
+                    MsmpEvent::Status(status) => {
+                        tracked.apply_snapshot(&status);
+                        if updates.send(SessionUpdate::Snapshot(status)).await.is_err() {
+                            return ConnectedOutcome::Finished;
+                        }
+                    }
+                    MsmpEvent::Other(method) => {
+                        log::debug!("Ignoring MSMP notification {method}");
+                    }
+                }
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    return ConnectedOutcome::Finished;
+                };
+                match command {
+                    SessionCommand::Stop { reply } => {
+                        let result = client.stop().await.map_err(|error| error.to_string());
+                        let failed = result.is_err();
+                        let error = result.as_ref().err().cloned();
+                        let _ = reply.send(result);
+                        if failed {
+                            return ConnectedOutcome::Disconnected(anyhow!(
+                                "failed to send stop request: {}",
+                                error.unwrap_or_else(|| "unknown error".to_owned())
+                            ));
+                        }
+                    }
+                }
+            }
+            _ = wait_for_deadline(tracked.idle_deadline) => {
+                log::info!("No players for {:?}; requesting server stop through MSMP", tracked.idle_timeout);
+                tracked.idle_deadline = None;
+                if let Err(error) = client.stop().await {
+                    return ConnectedOutcome::Disconnected(error.context("idle stop request failed"));
+                }
+            }
+            _ = wait_for_deadline(tracked.startup_deadline) => {
+                let _ = updates.send(SessionUpdate::Unavailable(
+                    "MSMP connected, but Minecraft did not report started within 60 seconds".to_owned()
+                )).await;
+                return ConnectedOutcome::Finished;
+            }
+        }
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => pending::<()>().await,
+    }
+}
+
+async fn connect_and_snapshot(config: &MsmpConfig) -> Result<(MsmpClient, ServerStatus)> {
+    let mut client = MsmpClient::connect(config).await?;
+    let status = client.server_status().await?;
+    Ok((client, status))
+}
+
+async fn connect_with_initial_retry(config: &MsmpConfig) -> Result<(MsmpClient, ServerStatus)> {
+    let deadline = Instant::now() + INITIAL_CONNECT_WINDOW;
+    let last_error = loop {
+        match connect_and_snapshot(config).await {
+            Ok(connection) => return Ok(connection),
+            Err(error) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break error;
+                }
+                sleep(RETRY_INTERVAL.min(deadline - now)).await;
+            }
+        }
+    };
+
+    Err(last_error).context("MSMP was unavailable for 60 seconds")
+}
+
+async fn reconnect(
+    config: &MsmpConfig,
+    updates: &mpsc::Sender<SessionUpdate>,
+) -> Result<(MsmpClient, ServerStatus)> {
+    let mut last_error = None;
+    for attempt in 1..=RECONNECT_ATTEMPTS {
+        if updates
+            .send(SessionUpdate::ReconnectAttempt(attempt))
+            .await
+            .is_err()
+        {
+            bail!("application stopped while reconnecting to MSMP");
+        }
+        sleep(RETRY_INTERVAL).await;
+        match connect_and_snapshot(config).await {
+            Ok(connection) => return Ok(connection),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("MSMP reconnect failed")))
+        .context("MSMP reconnect failed after 3 attempts")
 }
 
 pub async fn send_stop_command(properties_path: impl AsRef<Path>) -> Result<()> {
@@ -259,11 +657,67 @@ mod tests {
 
         assert!(status.started);
         assert_eq!(status.players.len(), 1);
-        assert_eq!(status.players[0].name, "jeb_");
+        assert_eq!(status.players[0].name.as_deref(), Some("jeb_"));
+    }
+
+    #[test]
+    fn parses_official_notification_names_and_payloads() {
+        let joined = parse_notification(&json!({
+            "jsonrpc": "2.0",
+            "method": "minecraft:notification/players/joined",
+            "params": {"id": "player-id", "name": "Alex"}
+        }))
+        .unwrap();
+        assert_eq!(
+            joined,
+            Some(MsmpEvent::PlayerJoined(Player {
+                id: Some("player-id".to_owned()),
+                name: Some("Alex".to_owned()),
+            }))
+        );
+
+        let status = parse_notification(&json!({
+            "jsonrpc": "2.0",
+            "method": "minecraft:notification/server/status",
+            "params": {"started": true, "players": []}
+        }))
+        .unwrap();
+        assert_eq!(
+            status,
+            Some(MsmpEvent::Status(ServerStatus {
+                started: true,
+                players: vec![],
+            }))
+        );
+    }
+
+    #[test]
+    fn event_tracking_preserves_idle_deadline_across_empty_heartbeats() {
+        let status = ServerStatus {
+            started: true,
+            players: vec![],
+        };
+        let mut tracked = TrackedServer::new(&status, Duration::from_secs(600));
+        let original_deadline = tracked.idle_deadline;
+
+        tracked.apply_snapshot(&status);
+        assert_eq!(tracked.idle_deadline, original_deadline);
+
+        let player = Player {
+            id: Some("player-id".to_owned()),
+            name: Some("Alex".to_owned()),
+        };
+        tracked.player_joined(player.clone());
+        assert_eq!(tracked.players.len(), 1);
+        assert!(tracked.idle_deadline.is_none());
+
+        tracked.player_left(&player);
+        assert!(tracked.players.is_empty());
+        assert!(tracked.idle_deadline.is_some());
     }
 
     #[tokio::test]
-    async fn authenticates_and_calls_server_status() {
+    async fn authenticates_queries_once_then_receives_notifications() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let secret = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcd";
@@ -285,7 +739,6 @@ mod tests {
                 panic!("expected a text request");
             };
             let request: Value = serde_json::from_str(request.as_str()).unwrap();
-            assert_eq!(request["jsonrpc"], "2.0");
             assert_eq!(request["method"], SERVER_STATUS_METHOD);
             assert_eq!(request["id"], 1);
 
@@ -293,11 +746,20 @@ mod tests {
                 .send(Message::Text(
                     json!({
                         "jsonrpc": "2.0",
+                        "method": "minecraft:notification/players/joined",
+                        "params": {"id": "player-id", "name": "Alex"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
                         "id": 1,
-                        "result": {
-                            "started": true,
-                            "players": []
-                        }
+                        "result": {"started": true, "players": []}
                     })
                     .to_string()
                     .into(),
@@ -309,12 +771,19 @@ mod tests {
         let config = MsmpConfig {
             url: format!("ws://{address}"),
             secret: secret.to_owned(),
+            server_port: 25565,
         };
         let mut client = MsmpClient::connect(&config).await.unwrap();
         let status = client.server_status().await.unwrap();
-
         assert!(status.started);
         assert!(status.players.is_empty());
+        assert_eq!(
+            client.next_event().await.unwrap(),
+            MsmpEvent::PlayerJoined(Player {
+                id: Some("player-id".to_owned()),
+                name: Some("Alex".to_owned()),
+            })
+        );
         server.await.unwrap();
     }
 }

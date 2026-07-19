@@ -2,23 +2,20 @@ pub mod config;
 pub mod msmp;
 
 use crate::config::Config;
-use crate::msmp::{MsmpClient, MsmpConfig};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant, interval, timeout};
+use tokio::time::{Duration, timeout};
 
 const MAX_PACKET_LENGTH: usize = 2 * 1024 * 1024;
 
 /// Basic enum to provide state machine system for server status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
+    Unknown,
     Stopped,
     Starting,
     Running,
@@ -205,111 +202,36 @@ pub fn launch_server(command: &str, args: &[&str]) -> Result<tokio::process::Chi
     }
 }
 
-/// Idle watchdog: polls Minecraft 26.2's management server every `poll_interval`.
-/// If no players have been online for `timeout`, stop the server through MSMP.
-pub async fn idle_watchdog_msmp(
-    properties_path: &Path,
-    poll_interval: Duration,
-    timeout: Duration,
-    server_state: Arc<Mutex<ServerState>>,
-) -> Result<()> {
-    log::info!(
-        "Starting MSMP idle watchdog using {} every {:?}",
-        properties_path.display(),
-        poll_interval
-    );
-    let start = Instant::now();
-
-    // MSMP 3.0.0 starts before the dedicated server. Wait until its status says
-    // the Minecraft server has finished starting before accepting proxy traffic.
-    loop {
-        match query_server_status(properties_path).await {
-            Ok(status) if status.started => break,
-            Ok(_) if start.elapsed() <= Duration::from_secs(600) => {
-                log::info!("MSMP is available; Minecraft 26.2 is still starting...");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(err) if start.elapsed() <= Duration::from_secs(600) => {
-                log::warn!("MSMP status check failed ({}), retrying...", err);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(err) => {
-                return Err(err);
-            }
-            Ok(_) => {
-                return Err(anyhow::anyhow!(
-                    "Minecraft server did not finish starting within 600 seconds"
-                ));
-            }
-        }
-    }
-
-    log::info!("Minecraft 26.2 is running and MSMP is ready");
-    {
-        let mut state =
-            match tokio::time::timeout(Duration::from_secs(5), server_state.lock()).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    log::error!("Deadlock detected! Failed to acquire state lock");
-                    panic!("State lock timeout - possible deadlock");
-                }
-            };
-        *state = ServerState::Running;
-        log::debug!("Server state set to Running in idle_watchdog_msmp()");
-    }
-
-    let mut ticker = interval(poll_interval);
-    let mut last_online = Instant::now();
-    let mut consecutive_errors = 0;
-
-    loop {
-        ticker.tick().await;
-        let status = loop {
-            match query_server_status(properties_path).await {
-                Ok(status) => {
-                    consecutive_errors = 0;
-                    break status;
-                }
-                Err(e) if consecutive_errors < 5 => {
-                    consecutive_errors += 1;
-                    log::warn!(
-                        "MSMP status poll failed: {}. Retrying... ({}/5)",
-                        e,
-                        consecutive_errors
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-                Err(e) => {
-                    log::error!("MSMP connection error: {}. Stopping watchdog.", e);
-                    return Err(e);
-                }
-            };
-        };
-        let count = status.players.len();
-        log::info!("MSMP reports {} connected player(s)", count);
-
-        if count > 0 {
-            last_online = Instant::now();
-        } else if last_online.elapsed() >= timeout {
-            log::info!("No players for {:?}, stopping server...", timeout);
-            msmp::send_stop_command(properties_path).await?;
-            break;
-        }
-    }
-    Ok(())
-}
-
-async fn query_server_status(properties_path: &Path) -> Result<msmp::ServerStatus> {
-    let config = MsmpConfig::from_server_properties(properties_path)?;
-    let mut client = MsmpClient::connect(&config).await?;
-    client.server_status().await
-}
-
 pub async fn send_starting_message(mut socket: TcpStream, config: &Config) -> Result<()> {
+    send_disconnect_message(
+        &mut socket,
+        &config.connection_msg_text,
+        &config.connection_msg_color,
+        config.connection_msg_bold,
+    )
+    .await
+}
+
+pub async fn send_reconnecting_message(mut socket: TcpStream, config: &Config) -> Result<()> {
+    send_disconnect_message(
+        &mut socket,
+        &config.reconnecting_msg_text,
+        &config.reconnecting_msg_color,
+        config.reconnecting_msg_bold,
+    )
+    .await
+}
+
+async fn send_disconnect_message(
+    socket: &mut TcpStream,
+    text: &str,
+    color: &str,
+    bold: bool,
+) -> Result<()> {
     let json_msg = json!({
-        "text": config.connection_msg_text,
-        "color": config.connection_msg_color,
-        "bold": config.connection_msg_bold
+        "text": text,
+        "color": color,
+        "bold": bold
     })
     .to_string();
     let mut packet_data = Vec::new();
@@ -324,14 +246,14 @@ pub async fn send_starting_message(mut socket: TcpStream, config: &Config) -> Re
     write_varint(packet_data.len() as i32, &mut packet);
     packet.extend_from_slice(&packet_data);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(5), socket.write_all(&packet)).await {
+    match timeout(Duration::from_secs(5), socket.write_all(&packet)).await {
         Ok(Ok(())) => (),
         Ok(Err(e)) => log::warn!("Sending starting message to client failed: {:?}", e),
         Err(_) => log::warn!("Sending starting message to client timed out"),
     }
 
     // Wait a short moment to let client consume data (required because otherwise client doesn't display json message)
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     socket.shutdown().await?;
     Ok(())
