@@ -1,21 +1,21 @@
 pub mod config;
+pub mod msmp;
 
 use crate::config::Config;
-use anyhow::Result;
-use rcon::Connection;
-use regex::Regex;
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant, interval, timeout};
+use tokio::time::{Duration, timeout};
+
+const MAX_PACKET_LENGTH: usize = 2 * 1024 * 1024;
 
 /// Basic enum to provide state machine system for server status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
+    Unknown,
     Stopped,
     Starting,
     Running,
@@ -39,6 +39,41 @@ fn read_varint(buf: &[u8]) -> Option<(i32, usize)> {
     None
 }
 
+/// Read exactly one length-prefixed Minecraft packet without consuming bytes
+/// belonging to the next packet on the TCP stream.
+async fn read_packet(socket: &mut TcpStream) -> Result<Option<Vec<u8>>> {
+    let mut packet_length = 0i32;
+
+    for byte_index in 0..5 {
+        let mut byte = [0u8; 1];
+        let bytes_read = socket.read(&mut byte).await?;
+        if bytes_read == 0 {
+            if byte_index == 0 {
+                return Ok(None);
+            }
+            bail!("connection closed in the middle of a packet length");
+        }
+
+        packet_length |= ((byte[0] & 0x7f) as i32) << (7 * byte_index);
+        if byte[0] & 0x80 == 0 {
+            if packet_length < 0 {
+                bail!("negative Minecraft packet length");
+            }
+
+            let packet_length = packet_length as usize;
+            if packet_length > MAX_PACKET_LENGTH {
+                bail!("Minecraft packet is too large: {packet_length} bytes");
+            }
+
+            let mut packet = vec![0u8; packet_length];
+            socket.read_exact(&mut packet).await?;
+            return Ok(Some(packet));
+        }
+    }
+
+    bail!("Minecraft packet length VarInt exceeds 5 bytes")
+}
+
 // Write a VarInt (Minecraft format)
 pub fn write_varint(mut val: i32, buf: &mut Vec<u8>) {
     loop {
@@ -58,16 +93,19 @@ pub async fn verify_handshake_packet(
     peer: SocketAddr,
     config: &Config,
 ) -> Result<bool> {
-    // 1) Read initial data, ignoring resets or immediate closes
-    let mut buf = [0u8; 512];
-
-    let n = match timeout(Duration::from_secs(5), socket.read(&mut buf)).await {
-        Ok(Ok(0)) => {
+    // Read only the framed handshake packet. A status request is commonly
+    // coalesced into the same TCP segment and must remain available for the
+    // status-state handler below.
+    let packet = match timeout(Duration::from_secs(5), read_packet(socket)).await {
+        Ok(Ok(None)) => {
             log::debug!("Connection closed immediately by {}", peer);
             return Ok(false);
         }
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) if e.kind() == ErrorKind::ConnectionReset => {
+        Ok(Ok(Some(packet))) => packet,
+        Ok(Err(e))
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == ErrorKind::ConnectionReset) =>
+        {
             log::debug!("Connection reset by peer {} (ignoring)", peer);
             return Ok(false);
         }
@@ -81,17 +119,11 @@ pub async fn verify_handshake_packet(
         }
     };
 
-    log::debug!("Received {} bytes: {:02X?}", n, &buf[..n]);
+    log::debug!("Received handshake packet: {:02X?}", packet);
 
-    // 2) Parse handshake packet (packet ID = 0, next_state = 2)
+    // Parse handshake packet (packet ID = 0).
     // More information on the handshake packet structure: https://minecraft.wiki/w/Java_Edition_protocol/Packets#Handshaking
-    // Skip packet length VarInt
-    let (_pkt_len, off1) = match read_varint(&buf[..n]) {
-        Some(v) => v,
-        None => return Ok(false),
-    };
-    // Packet ID VarInt
-    let (pkt_id, off2) = match read_varint(&buf[off1..n]) {
+    let (pkt_id, mut offset) = match read_varint(&packet) {
         Some(v) => v,
         None => return Ok(false),
     };
@@ -101,31 +133,37 @@ pub async fn verify_handshake_packet(
     }
 
     // Skip protocol version VarInt
-    let mut offset = off1 + off2;
-    let (_protocol_version, len) = match read_varint(&buf[offset..n]) {
+    let (_protocol_version, len) = match read_varint(&packet[offset..]) {
         Some(v) => v,
         None => return Ok(false),
     };
     offset += len;
 
     // Read address length and skip the address string
-    let (addr_len, len) = match read_varint(&buf[offset..n]) {
+    let (addr_len, len) = match read_varint(&packet[offset..]) {
         Some(v) => v,
         None => return Ok(false),
     };
     if addr_len < 0 {
         return Ok(false);
     }
-    offset += len + addr_len as usize;
+    offset += len;
+    offset = match offset.checked_add(addr_len as usize) {
+        Some(end) if end <= packet.len() => end,
+        _ => return Ok(false),
+    };
 
     // Skip the port (2 bytes)
-    offset += 2;
+    offset = match offset.checked_add(2) {
+        Some(end) if end <= packet.len() => end,
+        _ => return Ok(false),
+    };
 
     // Read next_state (intent) VarInt
-    if offset >= n {
+    if offset >= packet.len() {
         return Ok(false);
     }
-    if let Some((next_state, _)) = read_varint(&buf[offset..n]) {
+    if let Some((next_state, _)) = read_varint(&packet[offset..]) {
         if next_state == 1 {
             // Status ping
             handle_status_ping(socket, &config).await?;
@@ -164,145 +202,36 @@ pub fn launch_server(command: &str, args: &[&str]) -> Result<tokio::process::Chi
     }
 }
 
-/// Idle watchdog: polls the RCON `list` command every `poll_interval`.
-/// If no players have been online for `timeout`, send `/stop` via RCON and exit
-pub async fn idle_watchdog_rcon(
-    rcon_addr: &str,
-    rcon_pass: &str,
-    poll_interval: Duration,
-    timeout: Duration,
-    server_state: Arc<Mutex<ServerState>>,
-) -> Result<()> {
-    log::info!(
-        "Starting RCON idle watchdog: polling {} every {:?}",
-        rcon_addr,
-        poll_interval
-    );
-    let start = Instant::now();
-
-    // Wait for RCON to become available
-    let conn = loop {
-        match Connection::<TcpStream>::connect(rcon_addr, rcon_pass).await {
-            Ok(c) => break c,
-            Err(err) if start.elapsed() <= Duration::from_secs(600) => {
-                log::warn!("RCON connection failed ({}), retrying...", err);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(err) => {
-                {
-                    // Exclusively scoping all Mutex locks, even if it's not strictly necessary
-                    let mut state =
-                        match tokio::time::timeout(Duration::from_secs(5), server_state.lock())
-                            .await
-                        {
-                            Ok(guard) => guard,
-                            Err(_) => {
-                                log::error!("Deadlock detected! Failed to acquire state lock");
-                                panic!("State lock timeout - possible deadlock");
-                            }
-                        };
-                    *state = ServerState::Stopped;
-                    log::debug!("Server state set to Stopped in idle_watchdog_rcon()");
-                }
-                return Err(err.into());
-            }
-        }
-    };
-
-    let mut conn = conn;
-    log::info!("Successfully connected to RCON at {}", rcon_addr);
-    {
-        let mut state =
-            match tokio::time::timeout(Duration::from_secs(5), server_state.lock()).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    log::error!("Deadlock detected! Failed to acquire state lock");
-                    panic!("State lock timeout - possible deadlock");
-                }
-            };
-        *state = ServerState::Running;
-        log::debug!("Server state set to Running in idle_watchdog_rcon()");
-    }
-
-    // Polling loop
-    let player_count_re = Regex::new(r"There are (\d+) of a max").unwrap();
-    let mut ticker = interval(poll_interval);
-    let mut last_online = Instant::now();
-    let mut consecutive_errors = 0;
-
-    loop {
-        ticker.tick().await;
-        let response = loop {
-            match conn.cmd("list").await {
-                Ok(r) => {
-                    consecutive_errors = 0;
-                    break r;
-                }
-                Err(e) if consecutive_errors < 5 => {
-                    consecutive_errors += 1;
-                    log::warn!(
-                        "RCON `list` poll failed: {} \nRetrying... ({}/5)",
-                        e,
-                        consecutive_errors
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-                Err(e) => {
-                    log::error!("RCON connection error: {}. Stopping RCON watchdog.", e);
-                    {
-                        let mut state =
-                            match tokio::time::timeout(Duration::from_secs(5), server_state.lock())
-                                .await
-                            {
-                                Ok(guard) => guard,
-                                Err(_) => {
-                                    log::error!("Deadlock detected! Failed to acquire state lock");
-                                    panic!("State lock timeout - possible deadlock");
-                                }
-                            };
-                        *state = ServerState::Stopped;
-                        log::debug!("Server state set to Stopped in idle_watchdog_rcon()");
-                    }
-                    return Err(e.into());
-                }
-            };
-        };
-        log::info!("RCON list response: {}", response);
-
-        let count = player_count_re
-            .captures(&response)
-            .and_then(|caps| caps.get(1))
-            .and_then(|m| m.as_str().parse::<u32>().ok())
-            .unwrap_or(0);
-
-        if count > 0 {
-            last_online = Instant::now();
-        } else if last_online.elapsed() >= timeout {
-            log::info!("No players for {:?}, stopping server...", timeout);
-            let _ = conn.cmd("stop").await;
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Sends a single `/stop` command to the server via RCON and exits
-pub async fn send_stop_command(rcon_addr: &str, rcon_pass: &str) -> Result<()> {
-    log::info!(
-        "Connecting to RCON at {} to send stop command...",
-        rcon_addr
-    );
-    let mut conn = Connection::<TcpStream>::connect(rcon_addr, rcon_pass).await?;
-    let _ = conn.cmd("stop").await?;
-    log::info!("Stop command sent.");
-    Ok(())
-}
-
 pub async fn send_starting_message(mut socket: TcpStream, config: &Config) -> Result<()> {
+    send_disconnect_message(
+        &mut socket,
+        &config.connection_msg_text,
+        &config.connection_msg_color,
+        config.connection_msg_bold,
+    )
+    .await
+}
+
+pub async fn send_reconnecting_message(mut socket: TcpStream, config: &Config) -> Result<()> {
+    send_disconnect_message(
+        &mut socket,
+        &config.reconnecting_msg_text,
+        &config.reconnecting_msg_color,
+        config.reconnecting_msg_bold,
+    )
+    .await
+}
+
+async fn send_disconnect_message(
+    socket: &mut TcpStream,
+    text: &str,
+    color: &str,
+    bold: bool,
+) -> Result<()> {
     let json_msg = json!({
-        "text": config.connection_msg_text,
-        "color": config.connection_msg_color,
-        "bold": config.connection_msg_bold
+        "text": text,
+        "color": color,
+        "bold": bold
     })
     .to_string();
     let mut packet_data = Vec::new();
@@ -317,34 +246,38 @@ pub async fn send_starting_message(mut socket: TcpStream, config: &Config) -> Re
     write_varint(packet_data.len() as i32, &mut packet);
     packet.extend_from_slice(&packet_data);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(5), socket.write_all(&packet)).await {
+    match timeout(Duration::from_secs(5), socket.write_all(&packet)).await {
         Ok(Ok(())) => (),
         Ok(Err(e)) => log::warn!("Sending starting message to client failed: {:?}", e),
         Err(_) => log::warn!("Sending starting message to client timed out"),
     }
 
     // Wait a short moment to let client consume data (required because otherwise client doesn't display json message)
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     socket.shutdown().await?;
     Ok(())
 }
 
 async fn handle_status_ping(socket: &mut TcpStream, config: &Config) -> Result<()> {
-    // Read and discard the next packet (packet ID 0, status request)
-    let mut buf = [0u8; 512];
-    match tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut buf)).await {
-        Ok(_) => (),
-        Err(_) => log::warn!("Reading TcpStream timed out(handle_status_ping)"),
+    // Status request packet: ID 0x00 with no payload. Reading a complete frame
+    // is important because the handshake and request may share one TCP segment.
+    let request = timeout(Duration::from_secs(5), read_packet(socket))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for Minecraft status request"))??
+        .ok_or_else(|| anyhow::anyhow!("client closed before sending a status request"))?;
+    let (request_id, request_id_length) = read_varint(&request)
+        .ok_or_else(|| anyhow::anyhow!("status request has an invalid packet ID"))?;
+    if request_id != 0 || request_id_length != request.len() {
+        bail!("invalid Minecraft status request packet");
     }
 
     // Create custom MOTD JSON
-    // Protocol is "an integer used to check for incompatibilities between the player's client and the server
-    // they are trying to connect to.". 766 = Minecraft 1.20.5 (https://minecraft.fandom.com/wiki/Protocol_version)
+    // Minecraft 26.2 uses Java protocol version 776.
     let mut motd_json_obj = json!({
         "version": {
-            "name": "MCServerNap (1.20.5)",
-            "protocol": 766
+            "name": "MCServerNap (26.2)",
+            "protocol": 776
         },
         "players": {
             "max": 0,
@@ -380,12 +313,91 @@ async fn handle_status_ping(socket: &mut TcpStream, config: &Config) -> Result<(
     write_varint(data.len() as i32, &mut packet);
     packet.extend_from_slice(&data);
 
-    // Send to client
-    match tokio::time::timeout(std::time::Duration::from_secs(5), socket.write_all(&packet)).await {
-        Ok(Ok(())) => (),
-        Ok(Err(e)) => log::warn!("Sending MOTD to client failed: {:?}", e),
-        Err(_) => log::warn!("Sending MOTD to client timed out"),
+    timeout(Duration::from_secs(5), socket.write_all(&packet))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out sending Minecraft status response"))??;
+
+    // Ping request packet: ID 0x01 followed by an arbitrary 8-byte payload.
+    // Echoing that payload in a pong completes the server-list ping protocol.
+    let ping = timeout(Duration::from_secs(5), read_packet(socket))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for Minecraft ping request"))??
+        .ok_or_else(|| anyhow::anyhow!("client closed before sending a ping request"))?;
+    let (ping_id, ping_id_length) = read_varint(&ping)
+        .ok_or_else(|| anyhow::anyhow!("ping request has an invalid packet ID"))?;
+    if ping_id != 1 || ping.len() != ping_id_length + 8 {
+        bail!("invalid Minecraft ping request packet");
     }
+
+    let mut pong_data = Vec::with_capacity(9);
+    write_varint(1, &mut pong_data);
+    pong_data.extend_from_slice(&ping[ping_id_length..]);
+
+    let mut pong_packet = Vec::with_capacity(pong_data.len() + 1);
+    write_varint(pong_data.len() as i32, &mut pong_packet);
+    pong_packet.extend_from_slice(&pong_data);
+
+    timeout(Duration::from_secs(5), socket.write_all(&pong_packet))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out sending Minecraft pong response"))??;
+
     socket.shutdown().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn frame_packet(data: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::new();
+        write_varint(data.len() as i32, &mut packet);
+        packet.extend_from_slice(data);
+        packet
+    }
+
+    #[tokio::test]
+    async fn status_ping_handles_coalesced_handshake_and_request_and_replies_with_pong() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, peer) = listener.accept().await.unwrap();
+            verify_handshake_packet(&mut socket, peer, &Config::default()).await
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+
+        let mut handshake_data = Vec::new();
+        write_varint(0, &mut handshake_data);
+        write_varint(776, &mut handshake_data);
+        write_varint(9, &mut handshake_data);
+        handshake_data.extend_from_slice(b"localhost");
+        handshake_data.extend_from_slice(&25565u16.to_be_bytes());
+        write_varint(1, &mut handshake_data);
+
+        let mut initial_write = frame_packet(&handshake_data);
+        initial_write.extend_from_slice(&frame_packet(&[0]));
+        client.write_all(&initial_write).await.unwrap();
+
+        let response = read_packet(&mut client).await.unwrap().unwrap();
+        let (response_id, response_id_length) = read_varint(&response).unwrap();
+        assert_eq!(response_id, 0);
+        let (json_length, json_length_size) = read_varint(&response[response_id_length..]).unwrap();
+        let json_start = response_id_length + json_length_size;
+        let status: Value = serde_json::from_slice(&response[json_start..]).unwrap();
+        assert_eq!(json_length as usize, response.len() - json_start);
+        assert_eq!(status["version"]["protocol"], 776);
+
+        let ping_payload = 1_721_234_567_890i64.to_be_bytes();
+        let mut ping_data = vec![1];
+        ping_data.extend_from_slice(&ping_payload);
+        client.write_all(&frame_packet(&ping_data)).await.unwrap();
+
+        let pong = read_packet(&mut client).await.unwrap().unwrap();
+        assert_eq!(pong[0], 1);
+        assert_eq!(&pong[1..], &ping_payload);
+        assert!(!server.await.unwrap().unwrap());
+    }
 }

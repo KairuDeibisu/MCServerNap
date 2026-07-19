@@ -10,9 +10,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(default)]
 pub struct Config {
-    pub rcon_poll_interval: u64,
-    pub rcon_idle_timeout: u64,
+    pub idle_timeout: u64,
     pub motd_text: String,
     pub motd_color: String,
     pub motd_bold: bool,
@@ -20,14 +20,16 @@ pub struct Config {
     pub connection_msg_text: String,
     pub connection_msg_color: String,
     pub connection_msg_bold: bool,
+    pub reconnecting_msg_text: String,
+    pub reconnecting_msg_color: String,
+    pub reconnecting_msg_bold: bool,
     config_directory_name: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            rcon_poll_interval: 60,
-            rcon_idle_timeout: 600,
+            idle_timeout: 600,
             motd_text: "Napping... Join to start server".to_string(),
             motd_color: "aqua".to_string(),
             motd_bold: true,
@@ -36,6 +38,10 @@ impl Default for Config {
                 .to_string(),
             connection_msg_color: "light_purple".to_string(),
             connection_msg_bold: true,
+            reconnecting_msg_text:
+                "Management connection lost. Reconnecting; please try again shortly...".to_string(),
+            reconnecting_msg_color: "yellow".to_string(),
+            reconnecting_msg_bold: true,
             config_directory_name: "config".to_string(),
         }
     }
