@@ -32,7 +32,7 @@ enum Commands {
         /// Command to launch (e.g. 'java' or path to start script)
         cmd: String,
         /// Arguments for the command (pass all Java/batch args here)
-        #[arg(num_args(0..))]
+        #[arg(num_args(0..), trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
         /// Minecraft server port (use --server-port)
         #[arg(long)]
@@ -307,7 +307,6 @@ async fn main_loop(
                                         if let Err(e) = server_socket.shutdown().await {
                                             log::warn!(
                                                 "Failed to shutdown server socket for {}: {:?}",
-                                                peer,
                                                 e
                                             );
                                         }
