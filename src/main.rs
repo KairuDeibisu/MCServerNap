@@ -307,6 +307,7 @@ async fn main_loop(
                                         if let Err(e) = server_socket.shutdown().await {
                                             log::warn!(
                                                 "Failed to shutdown server socket for {}: {:?}",
+                                                peer,
                                                 e
                                             );
                                         }
