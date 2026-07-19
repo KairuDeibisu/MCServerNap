@@ -201,7 +201,7 @@ impl MsmpClient {
                 Message::Text(text) => {
                     let message: Value = serde_json::from_str(text.as_str())
                         .context("MSMP returned invalid JSON")?;
-                    if let Some(event) = parse_notification(&message)? {
+                    if let Some(event) = parse_notification_or_warn(&message) {
                         return Ok(event);
                     }
                 }
@@ -254,7 +254,7 @@ impl MsmpClient {
                             .ok_or_else(|| anyhow!("MSMP method {method} returned no result"));
                     }
 
-                    if let Some(event) = parse_notification(&response)? {
+                    if let Some(event) = parse_notification_or_warn(&response) {
                         self.pending_events.push_back(event);
                     }
                 }
@@ -294,10 +294,36 @@ fn parse_notification(message: &Value) -> Result<Option<MsmpEvent>> {
     Ok(Some(event))
 }
 
-fn decode_params<T: for<'de> Deserialize<'de>>(params: Value, wrapper: &str) -> Result<T> {
-    let value = params.get(wrapper).cloned().unwrap_or(params);
+fn parse_notification_or_warn(message: &Value) -> Option<MsmpEvent> {
+    match parse_notification(message) {
+        Ok(event) => event,
+        Err(error) => {
+            log::warn!("Ignoring invalid MSMP notification: {error:#}");
+            None
+        }
+    }
+}
+
+fn decode_params<T: for<'de> Deserialize<'de>>(params: Value, parameter: &str) -> Result<T> {
+    let value = match params {
+        Value::Array(mut values) => {
+            if values.len() != 1 {
+                bail!(
+                    "invalid MSMP notification parameter {parameter}: expected one positional value, got {}",
+                    values.len()
+                );
+            }
+            values.pop().expect("parameter count was checked")
+        }
+        Value::Object(mut values) => match values.remove(parameter) {
+            Some(value) => value,
+            None => Value::Object(values),
+        },
+        value => value,
+    };
+
     serde_json::from_value(value)
-        .with_context(|| format!("invalid MSMP notification parameter {wrapper}"))
+        .with_context(|| format!("invalid MSMP notification parameter {parameter}"))
 }
 
 #[derive(Debug)]
@@ -665,7 +691,7 @@ mod tests {
         let joined = parse_notification(&json!({
             "jsonrpc": "2.0",
             "method": "minecraft:notification/players/joined",
-            "params": {"id": "player-id", "name": "Alex"}
+            "params": [{"id": "player-id", "name": "Alex"}]
         }))
         .unwrap();
         assert_eq!(
@@ -679,7 +705,7 @@ mod tests {
         let status = parse_notification(&json!({
             "jsonrpc": "2.0",
             "method": "minecraft:notification/server/status",
-            "params": {"started": true, "players": []}
+            "params": [{"started": true, "players": []}]
         }))
         .unwrap();
         assert_eq!(
@@ -747,7 +773,22 @@ mod tests {
                     json!({
                         "jsonrpc": "2.0",
                         "method": "minecraft:notification/players/joined",
-                        "params": {"id": "player-id", "name": "Alex"}
+                        "params": [
+                            {"id": "first-player", "name": "Alex"},
+                            {"id": "second-player", "name": "Steve"}
+                        ]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "minecraft:notification/players/joined",
+                        "params": [{"id": "player-id", "name": "Alex"}]
                     })
                     .to_string()
                     .into(),
